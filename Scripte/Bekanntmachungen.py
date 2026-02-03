@@ -187,4 +187,106 @@ class Auslesen:
 
                     for i in range(len(rows)):
                         # Aus Tabelle holen
-                        datum_txt = self.driver.find_element
+                        datum_txt = self.driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_datum").text
+                        az = self.driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_azAkt").text
+                        gericht = self.driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_Gericht").text
+                        schuldner = self.driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_schuldner").text
+                        sitz = self.driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_Sitz").text
+                        register = self.driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_register").text
+
+                        # Veröffentlichungstext per Popup öffnen (robust)
+                        window_main = self.driver.window_handles[0]
+
+                        btn = wait.until(ec.element_to_be_clickable((
+                            By.XPATH,
+                            f"(//input[contains(@id, 'frm_detail:j_idt') and @type='image' and @alt='Veröffentlichungstext anzeigen'])[{i+1}]"
+                        )))
+                        self.driver.execute_script("arguments[0].click();", btn)
+
+                        try:
+                            WebDriverWait(self.driver, wait_long).until(lambda d: len(d.window_handles) > 1)
+                            window_popup = self.driver.window_handles[1]
+                            self.driver.switch_to.window(window_popup)
+
+                            pre = WebDriverWait(self.driver, wait_long).until(
+                                ec.presence_of_element_located((By.XPATH, ".//pre[@id='veroefftext']"))
+                            )
+                            veroeff = pre.text.replace("\n", " ").replace(";", ",")
+                        except Exception as e:
+                            log_line(f"{tag}: Warnung VeröffText nicht gelesen: {repr(e)}")
+                            veroeff = ""
+                        finally:
+                            # Popup schließen, zurück
+                            try:
+                                if len(self.driver.window_handles) > 1:
+                                    self.driver.close()
+                            except Exception:
+                                pass
+                            try:
+                                self.driver.switch_to.window(window_main)
+                            except Exception:
+                                pass
+
+                        # CSV schreiben (alle 7 Spalten)
+                        w.writerow([
+                            datum_txt.replace(";", ","),
+                            az.replace(";", ","),
+                            gericht.replace(";", ","),
+                            schuldner.replace(";", ","),
+                            sitz.replace(";", ","),
+                            register.replace(";", ","),
+                            veroeff
+                        ])
+                        row_count += 1
+
+                        # UI Status (nicht zu viel)
+                        if row_count <= 25 or row_count % 100 == 0:
+                            self.ausgabe.txt_edit.append(f"{tag}: {az} – {schuldner}")
+
+                        # Crash-sicher flushen
+                        if row_count % 20 == 0:
+                            f.flush()
+                            try:
+                                os.fsync(f.fileno())
+                            except Exception:
+                                pass
+
+                        # kleine Bremse
+                        if row_count % 50 == 0:
+                            time.sleep(0.2)
+
+                    # am Ende flush
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except Exception:
+                        pass
+
+                self.ausgabe.txt_edit.append(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
+                log_line(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
+
+                # Zurück zur Suchseite (Zurück-Button wenn vorhanden, sonst reload)
+                try:
+                    back_btn = wait.until(ec.element_to_be_clickable((By.XPATH, ".//input[@value='Zurück']")))
+                    back_btn.click()
+                except Exception:
+                    wait = self._open_search_page_and_set_land(url, wait_long)
+
+                # Datum vorwärts + INI aktualisieren
+                self.datum_von += datetime.timedelta(days=1)
+                Config.schreiben(cfg_file(self.land), cfg, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
+
+        except Exception as e:
+            log_exc("FATAL", e)
+            try:
+                self.ausgabe.txt_edit.append(f"FEHLER – Details siehe protokoll.txt: {e}")
+            except Exception:
+                pass
+
+        finally:
+            try:
+                if self.driver:
+                    self.driver.quit()
+            except Exception:
+                pass
+            log_line("=== ENDE AUSLESEN ===")
