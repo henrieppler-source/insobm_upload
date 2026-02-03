@@ -2,6 +2,7 @@
 
 import os
 import csv
+import time
 import datetime
 import traceback
 
@@ -16,11 +17,10 @@ from Scripte import Config
 
 
 # =========================================================
-# Hilfsfunktionen
+# Helper / Infrastruktur
 # =========================================================
 
 def cfg_file(land: str) -> str:
-    """INI-Datei eindeutig bestimmen"""
     p = os.path.join("Bekanntmachungen", f"config_{land}.ini")
     if os.path.exists(p):
         return p
@@ -28,7 +28,6 @@ def cfg_file(land: str) -> str:
 
 
 def read_timeouts(config):
-    """Timeouts aus INI lesen (mit Defaults)"""
     def _get(sec, key, default):
         try:
             return int(config.get(sec, {}).get(key, default))
@@ -42,7 +41,6 @@ def read_timeouts(config):
 
 
 def ensure_csv_exists(path):
-    """CSV sofort anlegen, damit sichtbar ist, wo geschrieben wird"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if not os.path.exists(path):
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -75,13 +73,14 @@ class Auslesen:
     def __init__(self, ausgabe):
         self.ausgabe = ausgabe
 
-        # nur Bayern (wie bei dir)
+        # aktuell nur Bayern
         self.bundesland = [("Bayern", "1")]
+
+        self.driver = None
 
         self.land = self.bundesland[0][0]
         self.kennung = self.bundesland[0][1]
 
-        self.driver = None
         self.datum_von = self._datum_von()
 
         self.ausgabe.txt_edit.append(
@@ -129,8 +128,8 @@ class Auslesen:
 
     def starten(self):
         log_line("=== START AUSLESEN ===")
-        log_line(f"CWD = {os.getcwd()}")
-        log_line(f"CSV = {self.csv_ausl}")
+        log_line(f"CWD={os.getcwd()}")
+        log_line(f"CSV={self.csv_ausl}")
 
         try:
             cfg = Config.daten_auslesen(cfg_file(self.land))
@@ -168,7 +167,6 @@ class Auslesen:
             for _ in range(tage):
                 tag = self.datum_von.strftime("%d.%m.%Y")
                 self.ausgabe.txt_edit.append(f"{tag}: Suche läuft …")
-                log_line(f"Suche {tag}")
 
                 self._set_datum(self.datum_von, wait)
 
@@ -183,12 +181,14 @@ class Auslesen:
                     if d.find_elements(By.ID, "tbl_ergebnis"):
                         return True
                     src = d.page_source.lower()
-                    return "keine" in src
+                    return ("keine bekanntmachungen" in src
+                            or "keine treffer" in src
+                            or "keine ergebnisse" in src)
 
                 try:
                     wait.until(ready)
                 except exceptions.TimeoutException:
-                    log_line(f"{tag}: Timeout – Seite langsam")
+                    log_line(f"{tag}: Timeout – Seite langsam, retry")
                     self.driver.refresh()
                     continue
 
@@ -204,10 +204,11 @@ class Auslesen:
                     continue
 
                 rows = table[0].find_elements(By.TAG_NAME, "tr")[1:]
-                log_line(f"{tag}: Treffer {len(rows)}")
+                log_line(f"{tag}: Treffer={len(rows)}")
 
                 with open(self.csv_ausl, "a", newline="", encoding="utf-8") as f:
                     w = csv.writer(f, delimiter=";")
+                    row_count = 0
 
                     for i, _ in enumerate(rows):
                         az = self.driver.find_element(
@@ -220,10 +221,22 @@ class Auslesen:
                             f"#tbl_ergebnis\\:{i}\\:otx_schuldner"
                         ).text.replace(";", ",")
 
-                        self.ausgabe.txt_edit.append(f"{tag}: {az} – {schuldner}")
-                        log_line(f"{tag}: {az} – {schuldner}")
-
                         w.writerow([tag, az, schuldner])
+                        row_count += 1
+
+                        if row_count % 20 == 0:
+                            f.flush()
+                            os.fsync(f.fileno())
+
+                        if row_count % 50 == 0:
+                            time.sleep(0.2)
+
+                f.flush()
+                os.fsync(f.fileno())
+
+                self.ausgabe.txt_edit.append(
+                    f"{tag}: CSV geschrieben ({row_count} Zeilen)"
+                )
 
                 self.datum_von += datetime.timedelta(days=1)
                 Config.schreiben(
@@ -236,7 +249,7 @@ class Auslesen:
             log_exc("FATAL", e)
             try:
                 self.ausgabe.txt_edit.append(
-                    f"FEHLER – siehe protokoll.txt: {e}"
+                    f"FEHLER – Details siehe protokoll.txt: {e}"
                 )
             except Exception:
                 pass
