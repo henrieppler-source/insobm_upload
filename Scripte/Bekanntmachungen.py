@@ -209,30 +209,34 @@ class Auslesen:
                 with open(self.csv_ausl, "a", newline="", encoding="utf-8") as f:
                     w = csv.writer(f, delimiter=";")
                     row_count = 0
-
+                
                     for i, _ in enumerate(rows):
                         az = self.driver.find_element(
                             By.CSS_SELECTOR,
                             f"#tbl_ergebnis\\:{i}\\:otx_azAkt"
                         ).text
-
+                
                         schuldner = self.driver.find_element(
                             By.CSS_SELECTOR,
                             f"#tbl_ergebnis\\:{i}\\:otx_schuldner"
                         ).text.replace(";", ",")
-
+                
                         w.writerow([tag, az, schuldner])
                         row_count += 1
-
+                
+                        # alle 20 Zeilen flushen (Crash-Schutz)
                         if row_count % 20 == 0:
                             f.flush()
                             os.fsync(f.fileno())
-
+                
+                        # kleine Bremse, damit geckodriver nicht stirbt
                         if row_count % 50 == 0:
                             time.sleep(0.2)
+                
+                    # am Ende NOCHMAL flushen (aber noch im with!)
+                    f.flush()
+                    os.fsync(f.fileno())
 
-                f.flush()
-                os.fsync(f.fileno())
 
                 self.ausgabe.txt_edit.append(
                     f"{tag}: CSV geschrieben ({row_count} Zeilen)"
@@ -262,3 +266,4 @@ class Auslesen:
                 pass
 
             log_line("=== ENDE AUSLESEN ===")
+
