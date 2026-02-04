@@ -90,8 +90,16 @@ class Auslesen:
     def _make_driver(self, firefox_path: str, page_load: int):
         options = Options()
         options.binary_location = firefox_path
-        options.add_argument("-headless")
-        options.set_preference("permissions.default.image", 2)  # Bilder aus
+
+        # --- Headless aus INI lesen ---
+        cfg = Config.daten_auslesen(cfg_file(self.land))
+        headless = cfg.get("selenium", {}).get("headless", "1") == "1"
+
+        if headless:
+            options.add_argument("-headless")
+
+        # Ressourcen sparen
+        options.set_preference("permissions.default.image", 2)
 
         driver = webdriver.Firefox(options=options)
         driver.set_page_load_timeout(page_load)
@@ -289,4 +297,5 @@ class Auslesen:
                     pass
 
         log_line("=== ENDE AUSLESEN ===")
+
 
