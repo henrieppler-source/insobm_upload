@@ -16,11 +16,16 @@ from selenium.common import exceptions
 from Scripte import Config
 
 
+# =========================================================
+# Config / Logging Helper
+# =========================================================
+
 def cfg_file(land: str) -> str:
     p = os.path.join("Bekanntmachungen", f"config_{land}.ini")
     if os.path.exists(p):
         return p
     return f"config_{land}.ini"
+
 
 def cfg_get(cfg, section: str, option: str, fallback: str = "") -> str:
     """
@@ -29,19 +34,26 @@ def cfg_get(cfg, section: str, option: str, fallback: str = "") -> str:
     """
     # dict-Variante
     if isinstance(cfg, dict):
-        return str(cfg.get(section, {}).get(option, fallback))
+        try:
+            return str(cfg.get(section, {}).get(option, fallback))
+        except Exception:
+            return str(fallback)
 
     # ConfigParser-Variante
     try:
+        # neuere ConfigParser unterstützen fallback=
         return str(cfg.get(section, option, fallback=fallback))
     except TypeError:
-        # ältere Signature ohne fallback=
+        # ältere Signatur ohne fallback=
         try:
             if cfg.has_option(section, option):
                 return str(cfg.get(section, option))
         except Exception:
             pass
         return str(fallback)
+    except Exception:
+        return str(fallback)
+
 
 def read_timeouts(cfg):
     def _get_int(section, option, default):
@@ -51,9 +63,10 @@ def read_timeouts(cfg):
             return int(default)
 
     wait_short = _get_int("timeouts", "wait_short", 30)
-    wait_long  = _get_int("timeouts", "wait_long", 120)
+    wait_long  = _get_int("timeouts", "wait_long", 180)
     page_load  = _get_int("timeouts", "page_load", wait_long)
     return wait_short, wait_long, page_load
+
 
 def ensure_csv_exists(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -77,6 +90,10 @@ def log_exc(prefix, e):
     log_line(f"{prefix}: {repr(e)}")
     log_line(traceback.format_exc())
 
+
+# =========================================================
+# Hauptklasse
+# =========================================================
 
 class Auslesen:
     def __init__(self, ausgabe):
@@ -102,18 +119,17 @@ class Auslesen:
 
         self.ausgabe.append(f"Auslesen abgeschlossen: {datetime.datetime.now()}")
 
+    # -----------------------------------------------------
+
     def _datum_von(self):
         cfg = Config.daten_auslesen(cfg_file(self.land))
-        return datetime.datetime.strptime(cfg["insobm"]["datum"], "%d.%m.%Y")
+        return datetime.datetime.strptime(cfg_get(cfg, "insobm", "datum", "01.01.2000"), "%d.%m.%Y")
 
-    def _make_driver(self, firefox_path: str, page_load: int):
+    # -----------------------------------------------------
+
+    def _make_driver(self, firefox_path: str, page_load: int, headless: bool):
         options = Options()
         options.binary_location = firefox_path
-
-        # --- Headless aus INI lesen (robust) ---
-        cfg = Config.daten_auslesen(cfg_file(self.land))
-        headless_raw = cfg_get(cfg, "selenium", "headless", "1").strip().lower()
-        headless = headless_raw in ("1", "true", "yes", "on")
 
         if headless:
             options.add_argument("-headless")
@@ -135,8 +151,9 @@ class Auslesen:
         land_opt.click()
         return wait
 
-    def _set_datum(self, driver, wait, datum):
+    def _set_datum(self, wait, datum):
         d = datum.strftime("%Y-%m-%d")
+
         von = wait.until(ec.presence_of_element_located((By.ID, "frm_suche:ldi_datumVon:datumHtml5")))
         von.clear()
         von.send_keys(d)
@@ -144,6 +161,8 @@ class Auslesen:
         bis = wait.until(ec.presence_of_element_located((By.ID, "frm_suche:ldi_datumBis:datumHtml5")))
         bis.clear()
         bis.send_keys(d)
+
+    # -----------------------------------------------------
 
     def starten_alle_tage(self):
         log_line("=== START AUSLESEN ===")
@@ -155,8 +174,13 @@ class Auslesen:
         cfg = Config.daten_auslesen(cfg_file(self.land))
         wait_short, wait_long, page_load = read_timeouts(cfg)
 
-        # !!! GUI-thread-sicher:
-        self.ausgabe.append(f"Timeouts: short={wait_short}s long={wait_long}s page_load={page_load}s")
+        firefox_path = cfg_get(cfg, "firefox", "pfad", "")
+        headless_raw = cfg_get(cfg, "selenium", "headless", "1").strip().lower()
+        headless = headless_raw in ("1", "true", "yes", "on")
+
+        self.ausgabe.append(
+            f"Timeouts: short={wait_short}s long={wait_long}s page_load={page_load}s | headless={1 if headless else 0}"
+        )
 
         datum_bis = datetime.datetime.today() - datetime.timedelta(days=1)
         tage = (datum_bis - self.datum_von).days + 1
@@ -168,7 +192,7 @@ class Auslesen:
 
             driver = None
             try:
-                driver = self._make_driver(cfg["firefox"]["pfad"], page_load)
+                driver = self._make_driver(firefox_path, page_load, headless)
                 wait = self._open_search_and_set_land(driver, url, wait_long)
 
                 # Datum setzen (mit Retry + Reload)
@@ -176,7 +200,7 @@ class Auslesen:
                 while True:
                     tries += 1
                     try:
-                        self._set_datum(driver, wait, self.datum_von)
+                        self._set_datum(wait, self.datum_von)
                         break
                     except exceptions.TimeoutException:
                         log_line(f"{tag}: _set_datum timeout (try {tries}) -> reload")
@@ -184,9 +208,11 @@ class Auslesen:
                             raise
                         wait = self._open_search_and_set_land(driver, url, wait_long)
 
+                # Suchen klicken
                 suchen = wait.until(ec.element_to_be_clickable((By.ID, "frm_suche:cbt_suchen")))
                 driver.execute_script("arguments[0].click();", suchen)
 
+                # warten bis Ergebnis oder "keine Treffer"
                 def ready(d):
                     if d.find_elements(By.ID, "tbl_ergebnis"):
                         return True
@@ -200,7 +226,7 @@ class Auslesen:
                     self.ausgabe.append(f"{tag}: keine Bekanntmachungen")
                     log_line(f"{tag}: keine Bekanntmachungen")
                     self.datum_von += datetime.timedelta(days=1)
-                    # !!! NICHT cfg (dict) übergeben:
+                    # NICHT cfg (dict/ConfigParser) übergeben -> verhindert lower()-Crash
                     Config.schreiben(cfg_file(self.land), None, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
                     continue
 
@@ -213,45 +239,70 @@ class Auslesen:
                 with open(self.csv_ausl, "a", newline="", encoding="utf-8-sig") as f:
                     w = csv.writer(f, delimiter=";")
 
+                    # Hinweis: wir iterieren stabil über rows, lesen aber Zellen RELATIV pro row
+                    # und holen bei Stale ggf. rows neu.
                     for i in range(len(rows)):
-                        datum_txt = driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_datum").text
-                        az = driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_azAkt").text
-                        gericht = driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_Gericht").text
-                        schuldner = driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_schuldner").text
-                        sitz = driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_Sitz").text
-                        register = driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_register").text
+                        # bei DOM-Neuaufbau kann row stale sein -> dann neu ziehen
+                        try:
+                            row = rows[i]
+                        except Exception:
+                            table = driver.find_element(By.ID, "tbl_ergebnis")
+                            rows = table.find_elements(By.TAG_NAME, "tr")[1:]
+                            row = rows[i]
 
+                        try:
+                            datum_txt = row.find_element(By.CSS_SELECTOR, "[id$=':otx_datum']").text
+                            az        = row.find_element(By.CSS_SELECTOR, "[id$=':otx_azAkt']").text
+                            gericht   = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Gericht']").text
+                            schuldner = row.find_element(By.CSS_SELECTOR, "[id$=':otx_schuldner']").text
+                            sitz      = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Sitz']").text
+                            register  = row.find_element(By.CSS_SELECTOR, "[id$=':otx_register']").text
+                        except exceptions.StaleElementReferenceException:
+                            table = driver.find_element(By.ID, "tbl_ergebnis")
+                            rows = table.find_elements(By.TAG_NAME, "tr")[1:]
+                            row = rows[i]
+                            datum_txt = row.find_element(By.CSS_SELECTOR, "[id$=':otx_datum']").text
+                            az        = row.find_element(By.CSS_SELECTOR, "[id$=':otx_azAkt']").text
+                            gericht   = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Gericht']").text
+                            schuldner = row.find_element(By.CSS_SELECTOR, "[id$=':otx_schuldner']").text
+                            sitz      = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Sitz']").text
+                            register  = row.find_element(By.CSS_SELECTOR, "[id$=':otx_register']").text
+
+                        # Veröffentlichungstext: Button AUS DER ZEILE holen (stabiler als globaler XPath)
                         veroeff = ""
                         try:
                             window_main = driver.window_handles[0]
-                            btn = wait.until(ec.element_to_be_clickable((
-                                By.XPATH,
-                                f"(//input[contains(@id, 'frm_detail:j_idt') and @type='image' and @alt='Veröffentlichungstext anzeigen'])[{i+1}]"
-                            )))
+                            btn = row.find_element(By.CSS_SELECTOR, "input[alt='Veröffentlichungstext anzeigen']")
                             driver.execute_script("arguments[0].click();", btn)
 
                             WebDriverWait(driver, wait_long).until(lambda d: len(d.window_handles) > 1)
-                            window_popup = driver.window_handles[1]
-                            driver.switch_to.window(window_popup)
+                            driver.switch_to.window(driver.window_handles[1])
 
                             pre = WebDriverWait(driver, wait_long).until(
                                 ec.presence_of_element_located((By.XPATH, ".//pre[@id='veroefftext']"))
                             )
                             veroeff = pre.text.replace("\n", " ").replace(";", ",")
+                        except exceptions.TimeoutException:
+                            log_line(f"{tag}: Warnung VeröffText nicht gelesen: TimeoutException()")
+                            veroeff = ""
+                        except exceptions.StaleElementReferenceException:
+                            # wenn row stale wurde, holen wir VeröffText nicht mehr, schreiben leer
+                            log_line(f"{tag}: Warnung VeröffText nicht gelesen: StaleElementReferenceException()")
+                            veroeff = ""
                         except Exception as e:
                             log_line(f"{tag}: Warnung VeröffText nicht gelesen: {repr(e)}")
                             veroeff = ""
                         finally:
+                            # Popup cleanup (auch wenn nicht klar ist, ob eins offen ist)
                             try:
-                                if len(driver.window_handles) > 1:
+                                while len(driver.window_handles) > 1:
+                                    driver.switch_to.window(driver.window_handles[-1])
                                     driver.close()
-                            except Exception:
-                                pass
-                            try:
-                                driver.switch_to.window(window_main)
+                                driver.switch_to.window(driver.window_handles[0])
                             except Exception:
                                 pass
 
+                        # CSV schreiben (alle 7 Spalten)
                         w.writerow([
                             datum_txt.replace(";", ","),
                             az.replace(";", ","),
@@ -261,12 +312,13 @@ class Auslesen:
                             register.replace(";", ","),
                             veroeff
                         ])
-
                         row_count += 1
 
+                        # Status (sparsam)
                         if row_count <= 20 or row_count % 100 == 0:
                             self.ausgabe.append(f"{tag}: {row_count}/{len(rows)} …")
 
+                        # Crash-sicher flushen
                         if row_count % 20 == 0:
                             f.flush()
                             try:
@@ -274,9 +326,11 @@ class Auslesen:
                             except Exception:
                                 pass
 
+                        # kleine Bremse gegen Driver/Firefox Stress
                         if row_count % 50 == 0:
                             time.sleep(0.2)
 
+                    # final flush
                     f.flush()
                     try:
                         os.fsync(f.fileno())
@@ -286,8 +340,8 @@ class Auslesen:
                 self.ausgabe.append(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
                 log_line(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
 
+                # Datum vorwärts + INI aktualisieren
                 self.datum_von += datetime.timedelta(days=1)
-                # !!! NICHT cfg (dict) übergeben:
                 Config.schreiben(cfg_file(self.land), None, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
 
             except Exception as e:
@@ -306,4 +360,3 @@ class Auslesen:
                     pass
 
         log_line("=== ENDE AUSLESEN ===")
-
