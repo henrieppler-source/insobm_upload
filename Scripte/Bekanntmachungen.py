@@ -32,19 +32,15 @@ def cfg_get(cfg, section: str, option: str, fallback: str = "") -> str:
     Robust: funktioniert sowohl für dict (cfg[section][option])
     als auch für configparser.ConfigParser (cfg.get(section, option)).
     """
-    # dict-Variante
     if isinstance(cfg, dict):
         try:
             return str(cfg.get(section, {}).get(option, fallback))
         except Exception:
             return str(fallback)
 
-    # ConfigParser-Variante
     try:
-        # neuere ConfigParser unterstützen fallback=
         return str(cfg.get(section, option, fallback=fallback))
     except TypeError:
-        # ältere Signatur ohne fallback=
         try:
             if cfg.has_option(section, option):
                 return str(cfg.get(section, option))
@@ -226,7 +222,6 @@ class Auslesen:
                     self.ausgabe.append(f"{tag}: keine Bekanntmachungen")
                     log_line(f"{tag}: keine Bekanntmachungen")
                     self.datum_von += datetime.timedelta(days=1)
-                    # NICHT cfg (dict/ConfigParser) übergeben -> verhindert lower()-Crash
                     Config.schreiben(cfg_file(self.land), None, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
                     continue
 
@@ -239,10 +234,8 @@ class Auslesen:
                 with open(self.csv_ausl, "a", newline="", encoding="utf-8-sig") as f:
                     w = csv.writer(f, delimiter=";")
 
-                    # Hinweis: wir iterieren stabil über rows, lesen aber Zellen RELATIV pro row
-                    # und holen bei Stale ggf. rows neu.
                     for i in range(len(rows)):
-                        # bei DOM-Neuaufbau kann row stale sein -> dann neu ziehen
+                        # row kann stale werden -> bei Bedarf rows neu holen
                         try:
                             row = rows[i]
                         except Exception:
@@ -268,10 +261,10 @@ class Auslesen:
                             sitz      = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Sitz']").text
                             register  = row.find_element(By.CSS_SELECTOR, "[id$=':otx_register']").text
 
-                        # Veröffentlichungstext: Button AUS DER ZEILE holen (stabiler als globaler XPath)
+                        # Veröffentlichungstext: Button aus DER ZEILE holen
                         veroeff = ""
+                        veroeff_ok = True  # <<< FIX: steuert, ob wir nach Popup-Fehler weiter anfassen dürfen
                         try:
-                            window_main = driver.window_handles[0]
                             btn = row.find_element(By.CSS_SELECTOR, "input[alt='Veröffentlichungstext anzeigen']")
                             driver.execute_script("arguments[0].click();", btn)
 
@@ -285,15 +278,17 @@ class Auslesen:
                         except exceptions.TimeoutException:
                             log_line(f"{tag}: Warnung VeröffText nicht gelesen: TimeoutException()")
                             veroeff = ""
+                            veroeff_ok = False
                         except exceptions.StaleElementReferenceException:
-                            # wenn row stale wurde, holen wir VeröffText nicht mehr, schreiben leer
                             log_line(f"{tag}: Warnung VeröffText nicht gelesen: StaleElementReferenceException()")
                             veroeff = ""
+                            veroeff_ok = False
                         except Exception as e:
                             log_line(f"{tag}: Warnung VeröffText nicht gelesen: {repr(e)}")
                             veroeff = ""
+                            veroeff_ok = False
                         finally:
-                            # Popup cleanup (auch wenn nicht klar ist, ob eins offen ist)
+                            # Popup cleanup
                             try:
                                 while len(driver.window_handles) > 1:
                                     driver.switch_to.window(driver.window_handles[-1])
@@ -302,7 +297,35 @@ class Auslesen:
                             except Exception:
                                 pass
 
-                        # CSV schreiben (alle 7 Spalten)
+                        # <<< FIX: Bei Popup/Timeout NICHT weiter am DOM rummachen -> Zeile schreiben & weiter
+                        if not veroeff_ok:
+                            w.writerow([
+                                datum_txt.replace(";", ","),
+                                az.replace(";", ","),
+                                gericht.replace(";", ","),
+                                schuldner.replace(";", ","),
+                                sitz.replace(";", ","),
+                                register.replace(";", ","),
+                                veroeff
+                            ])
+                            row_count += 1
+
+                            if row_count <= 20 or row_count % 100 == 0:
+                                self.ausgabe.append(f"{tag}: {row_count}/{len(rows)} …")
+
+                            if row_count % 20 == 0:
+                                f.flush()
+                                try:
+                                    os.fsync(f.fileno())
+                                except Exception:
+                                    pass
+
+                            if row_count % 50 == 0:
+                                time.sleep(0.2)
+
+                            continue
+
+                        # Normalfall: Zeile ok
                         w.writerow([
                             datum_txt.replace(";", ","),
                             az.replace(";", ","),
