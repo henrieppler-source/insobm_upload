@@ -22,19 +22,38 @@ def cfg_file(land: str) -> str:
         return p
     return f"config_{land}.ini"
 
+def cfg_get(cfg, section: str, option: str, fallback: str = "") -> str:
+    """
+    Robust: funktioniert sowohl für dict (cfg[section][option])
+    als auch für configparser.ConfigParser (cfg.get(section, option)).
+    """
+    # dict-Variante
+    if isinstance(cfg, dict):
+        return str(cfg.get(section, {}).get(option, fallback))
 
-def read_timeouts(config):
-    def _get(sec, key, default):
+    # ConfigParser-Variante
+    try:
+        return str(cfg.get(section, option, fallback=fallback))
+    except TypeError:
+        # ältere Signature ohne fallback=
         try:
-            return int(config.get(sec, {}).get(key, default))
+            if cfg.has_option(section, option):
+                return str(cfg.get(section, option))
+        except Exception:
+            pass
+        return str(fallback)
+
+def read_timeouts(cfg):
+    def _get_int(section, option, default):
+        try:
+            return int(cfg_get(cfg, section, option, str(default)))
         except Exception:
             return int(default)
 
-    wait_short = _get("timeouts", "wait_short", 30)
-    wait_long = _get("timeouts", "wait_long", 120)
-    page_load = _get("timeouts", "page_load", wait_long)
+    wait_short = _get_int("timeouts", "wait_short", 30)
+    wait_long  = _get_int("timeouts", "wait_long", 120)
+    page_load  = _get_int("timeouts", "page_load", wait_long)
     return wait_short, wait_long, page_load
-
 
 def ensure_csv_exists(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -93,7 +112,7 @@ class Auslesen:
 
         # --- Headless aus INI lesen (robust) ---
         cfg = Config.daten_auslesen(cfg_file(self.land))
-        headless_raw = str(cfg.get("selenium", {}).get("headless", "1")).strip().lower()
+        headless_raw = cfg_get(cfg, "selenium", "headless", "1").strip().lower()
         headless = headless_raw in ("1", "true", "yes", "on")
 
         if headless:
@@ -287,3 +306,4 @@ class Auslesen:
                     pass
 
         log_line("=== ENDE AUSLESEN ===")
+
