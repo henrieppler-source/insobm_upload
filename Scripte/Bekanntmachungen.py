@@ -91,9 +91,10 @@ class Auslesen:
         options = Options()
         options.binary_location = firefox_path
 
-        # --- Headless aus INI lesen ---
+        # --- Headless aus INI lesen (robust) ---
         cfg = Config.daten_auslesen(cfg_file(self.land))
-        headless = cfg.get("selenium", {}).get("headless", "1") == "1"
+        headless_raw = str(cfg.get("selenium", {}).get("headless", "1")).strip().lower()
+        headless = headless_raw in ("1", "true", "yes", "on")
 
         if headless:
             options.add_argument("-headless")
@@ -135,19 +136,17 @@ class Auslesen:
         cfg = Config.daten_auslesen(cfg_file(self.land))
         wait_short, wait_long, page_load = read_timeouts(cfg)
 
-        self.ausgabe.txt_edit.append(
-            f"Timeouts: short={wait_short}s long={wait_long}s page_load={page_load}s"
-        )
+        # !!! GUI-thread-sicher:
+        self.ausgabe.append(f"Timeouts: short={wait_short}s long={wait_long}s page_load={page_load}s")
 
         datum_bis = datetime.datetime.today() - datetime.timedelta(days=1)
         tage = (datum_bis - self.datum_von).days + 1
 
         for _ in range(tage):
             tag = self.datum_von.strftime("%d.%m.%Y")
-            self.ausgabe.txt_edit.append(f"{tag}: starte Tag (neue Browser-Session)")
+            self.ausgabe.append(f"{tag}: starte Tag (neue Browser-Session)")
             log_line(f"{tag}: Tagstart")
 
-            # pro Tag neue Session (gegen harte Abstürze)
             driver = None
             try:
                 driver = self._make_driver(cfg["firefox"]["pfad"], page_load)
@@ -166,11 +165,9 @@ class Auslesen:
                             raise
                         wait = self._open_search_and_set_land(driver, url, wait_long)
 
-                # Suchen klicken
                 suchen = wait.until(ec.element_to_be_clickable((By.ID, "frm_suche:cbt_suchen")))
                 driver.execute_script("arguments[0].click();", suchen)
 
-                # warten bis Ergebnis oder "keine Treffer"
                 def ready(d):
                     if d.find_elements(By.ID, "tbl_ergebnis"):
                         return True
@@ -181,10 +178,11 @@ class Auslesen:
 
                 tables = driver.find_elements(By.ID, "tbl_ergebnis")
                 if not tables:
-                    self.ausgabe.txt_edit.append(f"{tag}: keine Bekanntmachungen")
+                    self.ausgabe.append(f"{tag}: keine Bekanntmachungen")
                     log_line(f"{tag}: keine Bekanntmachungen")
                     self.datum_von += datetime.timedelta(days=1)
-                    Config.schreiben(cfg_file(self.land), cfg, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
+                    # !!! NICHT cfg (dict) übergeben:
+                    Config.schreiben(cfg_file(self.land), None, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
                     continue
 
                 table = tables[0]
@@ -193,7 +191,6 @@ class Auslesen:
 
                 row_count = 0
 
-                # CSV append (utf-8-sig für Excel)
                 with open(self.csv_ausl, "a", newline="", encoding="utf-8-sig") as f:
                     w = csv.writer(f, delimiter=";")
 
@@ -205,7 +202,6 @@ class Auslesen:
                         sitz = driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_Sitz").text
                         register = driver.find_element(By.CSS_SELECTOR, f"#tbl_ergebnis\\:{i}\\:otx_register").text
 
-                        # Veröffentlichungstext – Popup öffnen (wie gehabt), aber sauber abgesichert
                         veroeff = ""
                         try:
                             window_main = driver.window_handles[0]
@@ -249,11 +245,9 @@ class Auslesen:
 
                         row_count += 1
 
-                        # Status (sparsam)
                         if row_count <= 20 or row_count % 100 == 0:
-                            self.ausgabe.txt_edit.append(f"{tag}: {row_count}/{len(rows)} …")
+                            self.ausgabe.append(f"{tag}: {row_count}/{len(rows)} …")
 
-                        # Crash-sicher flushen
                         if row_count % 20 == 0:
                             f.flush()
                             try:
@@ -261,32 +255,28 @@ class Auslesen:
                             except Exception:
                                 pass
 
-                        # kleine Bremse gegen Driver-Absturz
                         if row_count % 50 == 0:
                             time.sleep(0.2)
 
-                    # final flush
                     f.flush()
                     try:
                         os.fsync(f.fileno())
                     except Exception:
                         pass
 
-                self.ausgabe.txt_edit.append(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
+                self.ausgabe.append(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
                 log_line(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
 
-                # Datum vorwärts + INI aktualisieren
                 self.datum_von += datetime.timedelta(days=1)
-                Config.schreiben(cfg_file(self.land), cfg, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
+                # !!! NICHT cfg (dict) übergeben:
+                Config.schreiben(cfg_file(self.land), None, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
 
             except Exception as e:
                 log_exc(f"FATAL am Tag {tag}", e)
                 try:
-                    self.ausgabe.txt_edit.append(f"{tag}: FEHLER – Details siehe protokoll.txt")
+                    self.ausgabe.append(f"{tag}: FEHLER – Details siehe protokoll.txt")
                 except Exception:
                     pass
-                # Tag überspringen oder abbrechen? -> wir überspringen NICHT, sondern brechen ab,
-                # damit du den Fehler gezielt siehst.
                 break
 
             finally:
@@ -297,5 +287,3 @@ class Auslesen:
                     pass
 
         log_line("=== ENDE AUSLESEN ===")
-
-
