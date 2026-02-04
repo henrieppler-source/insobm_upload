@@ -71,7 +71,7 @@ class Auslesen:
 
         self.datum_von = self._datum_von()
 
-        self.ausgabe.txt_edit.append(f"Auslesen wird begonnen: {datetime.datetime.now()}")
+        self.ausgabe.append(f"Auslesen wird begonnen: {datetime.datetime.now()}")
 
         for land, kennung in self.bundesland:
             self.land = land
@@ -81,7 +81,7 @@ class Auslesen:
             ensure_csv_exists(self.csv_ausl)
             self.starten_alle_tage()
 
-        self.ausgabe.txt_edit.append(f"Auslesen abgeschlossen: {datetime.datetime.now()}")
+        self.ausgabe.append(f"Auslesen abgeschlossen: {datetime.datetime.now()}")
 
     def _datum_von(self):
         cfg = Config.daten_auslesen(cfg_file(self.land))
@@ -289,3 +289,4 @@ class Auslesen:
                     pass
 
         log_line("=== ENDE AUSLESEN ===")
+
