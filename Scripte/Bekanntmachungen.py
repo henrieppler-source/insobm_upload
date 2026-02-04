@@ -187,6 +187,8 @@ class Auslesen:
             log_line(f"{tag}: Tagstart")
 
             driver = None
+            tag_ok = True  # <<< Tages-Abbruch-Fix: nur bei True Datum fortschreiben
+
             try:
                 driver = self._make_driver(firefox_path, page_load, headless)
                 wait = self._open_search_and_set_land(driver, url, wait_long)
@@ -201,6 +203,7 @@ class Auslesen:
                     except exceptions.TimeoutException:
                         log_line(f"{tag}: _set_datum timeout (try {tries}) -> reload")
                         if tries >= 3:
+                            tag_ok = False
                             raise
                         wait = self._open_search_and_set_land(driver, url, wait_long)
 
@@ -215,90 +218,93 @@ class Auslesen:
                     src = d.page_source.lower()
                     return ("keine bekanntmachungen" in src or "keine treffer" in src or "keine ergebnisse" in src)
 
-                wait.until(ready)
+                try:
+                    wait.until(ready)
+                except exceptions.TimeoutException:
+                    tag_ok = False
+                    raise
 
                 tables = driver.find_elements(By.ID, "tbl_ergebnis")
                 if not tables:
                     self.ausgabe.append(f"{tag}: keine Bekanntmachungen")
                     log_line(f"{tag}: keine Bekanntmachungen")
-                    self.datum_von += datetime.timedelta(days=1)
-                    Config.schreiben(cfg_file(self.land), None, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
-                    continue
+                else:
+                    table = tables[0]
+                    rows = table.find_elements(By.TAG_NAME, "tr")[1:]
+                    log_line(f"{tag}: Treffer={len(rows)}")
 
-                table = tables[0]
-                rows = table.find_elements(By.TAG_NAME, "tr")[1:]
-                log_line(f"{tag}: Treffer={len(rows)}")
+                    row_count = 0
 
-                row_count = 0
+                    with open(self.csv_ausl, "a", newline="", encoding="utf-8-sig") as f:
+                        w = csv.writer(f, delimiter=";")
 
-                with open(self.csv_ausl, "a", newline="", encoding="utf-8-sig") as f:
-                    w = csv.writer(f, delimiter=";")
-
-                    for i in range(len(rows)):
-                        # row kann stale werden -> bei Bedarf rows neu holen
-                        try:
-                            row = rows[i]
-                        except Exception:
-                            table = driver.find_element(By.ID, "tbl_ergebnis")
-                            rows = table.find_elements(By.TAG_NAME, "tr")[1:]
-                            row = rows[i]
-
-                        try:
-                            datum_txt = row.find_element(By.CSS_SELECTOR, "[id$=':otx_datum']").text
-                            az        = row.find_element(By.CSS_SELECTOR, "[id$=':otx_azAkt']").text
-                            gericht   = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Gericht']").text
-                            schuldner = row.find_element(By.CSS_SELECTOR, "[id$=':otx_schuldner']").text
-                            sitz      = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Sitz']").text
-                            register  = row.find_element(By.CSS_SELECTOR, "[id$=':otx_register']").text
-                        except exceptions.StaleElementReferenceException:
-                            table = driver.find_element(By.ID, "tbl_ergebnis")
-                            rows = table.find_elements(By.TAG_NAME, "tr")[1:]
-                            row = rows[i]
-                            datum_txt = row.find_element(By.CSS_SELECTOR, "[id$=':otx_datum']").text
-                            az        = row.find_element(By.CSS_SELECTOR, "[id$=':otx_azAkt']").text
-                            gericht   = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Gericht']").text
-                            schuldner = row.find_element(By.CSS_SELECTOR, "[id$=':otx_schuldner']").text
-                            sitz      = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Sitz']").text
-                            register  = row.find_element(By.CSS_SELECTOR, "[id$=':otx_register']").text
-
-                        # Veröffentlichungstext: Button aus DER ZEILE holen
-                        veroeff = ""
-                        veroeff_ok = True  # <<< FIX: steuert, ob wir nach Popup-Fehler weiter anfassen dürfen
-                        try:
-                            btn = row.find_element(By.CSS_SELECTOR, "input[alt='Veröffentlichungstext anzeigen']")
-                            driver.execute_script("arguments[0].click();", btn)
-
-                            WebDriverWait(driver, wait_long).until(lambda d: len(d.window_handles) > 1)
-                            driver.switch_to.window(driver.window_handles[1])
-
-                            pre = WebDriverWait(driver, wait_long).until(
-                                ec.presence_of_element_located((By.XPATH, ".//pre[@id='veroefftext']"))
-                            )
-                            veroeff = pre.text.replace("\n", " ").replace(";", ",")
-                        except exceptions.TimeoutException:
-                            log_line(f"{tag}: Warnung VeröffText nicht gelesen: TimeoutException()")
-                            veroeff = ""
-                            veroeff_ok = False
-                        except exceptions.StaleElementReferenceException:
-                            log_line(f"{tag}: Warnung VeröffText nicht gelesen: StaleElementReferenceException()")
-                            veroeff = ""
-                            veroeff_ok = False
-                        except Exception as e:
-                            log_line(f"{tag}: Warnung VeröffText nicht gelesen: {repr(e)}")
-                            veroeff = ""
-                            veroeff_ok = False
-                        finally:
-                            # Popup cleanup
+                        for i in range(len(rows)):
+                            # Falls DOM neu -> rows neu holen
                             try:
-                                while len(driver.window_handles) > 1:
-                                    driver.switch_to.window(driver.window_handles[-1])
-                                    driver.close()
-                                driver.switch_to.window(driver.window_handles[0])
+                                row = rows[i]
                             except Exception:
-                                pass
+                                table = driver.find_element(By.ID, "tbl_ergebnis")
+                                rows = table.find_elements(By.TAG_NAME, "tr")[1:]
+                                row = rows[i]
 
-                        # <<< FIX: Bei Popup/Timeout NICHT weiter am DOM rummachen -> Zeile schreiben & weiter
-                        if not veroeff_ok:
+                            try:
+                                datum_txt = row.find_element(By.CSS_SELECTOR, "[id$=':otx_datum']").text
+                                az        = row.find_element(By.CSS_SELECTOR, "[id$=':otx_azAkt']").text
+                                gericht   = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Gericht']").text
+                                schuldner = row.find_element(By.CSS_SELECTOR, "[id$=':otx_schuldner']").text
+                                sitz      = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Sitz']").text
+                                register  = row.find_element(By.CSS_SELECTOR, "[id$=':otx_register']").text
+                            except exceptions.StaleElementReferenceException:
+                                table = driver.find_element(By.ID, "tbl_ergebnis")
+                                rows = table.find_elements(By.TAG_NAME, "tr")[1:]
+                                row = rows[i]
+                                datum_txt = row.find_element(By.CSS_SELECTOR, "[id$=':otx_datum']").text
+                                az        = row.find_element(By.CSS_SELECTOR, "[id$=':otx_azAkt']").text
+                                gericht   = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Gericht']").text
+                                schuldner = row.find_element(By.CSS_SELECTOR, "[id$=':otx_schuldner']").text
+                                sitz      = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Sitz']").text
+                                register  = row.find_element(By.CSS_SELECTOR, "[id$=':otx_register']").text
+
+                            veroeff = ""
+                            veroeff_ok = True
+
+                            try:
+                                btn = row.find_element(By.CSS_SELECTOR, "input[alt='Veröffentlichungstext anzeigen']")
+                                driver.execute_script("arguments[0].click();", btn)
+
+                                WebDriverWait(driver, wait_long).until(lambda d: len(d.window_handles) > 1)
+                                driver.switch_to.window(driver.window_handles[1])
+
+                                pre = WebDriverWait(driver, wait_long).until(
+                                    ec.presence_of_element_located((By.XPATH, ".//pre[@id='veroefftext']"))
+                                )
+                                veroeff = pre.text.replace("\n", " ").replace(";", ",")
+                            except exceptions.TimeoutException:
+                                log_line(f"{tag}: Warnung VeröffText nicht gelesen: TimeoutException()")
+                                veroeff = ""
+                                veroeff_ok = False
+                                tag_ok = False  # <<< Tages-Abbruch: bei Selenium-Fehler Tag als "nicht OK"
+                            except exceptions.StaleElementReferenceException:
+                                log_line(f"{tag}: Warnung VeröffText nicht gelesen: StaleElementReferenceException()")
+                                veroeff = ""
+                                veroeff_ok = False
+                                tag_ok = False
+                            except Exception as e:
+                                log_line(f"{tag}: Warnung VeröffText nicht gelesen: {repr(e)}")
+                                veroeff = ""
+                                veroeff_ok = False
+                                tag_ok = False
+                            finally:
+                                # Popup cleanup
+                                try:
+                                    while len(driver.window_handles) > 1:
+                                        driver.switch_to.window(driver.window_handles[-1])
+                                        driver.close()
+                                    driver.switch_to.window(driver.window_handles[0])
+                                except Exception:
+                                    pass
+
+                            # <<< Tages-Abbruch-Fix: sobald ein Selenium-Fehler im Tag war -> sauber raus
                             w.writerow([
                                 datum_txt.replace(";", ","),
                                 az.replace(";", ","),
@@ -323,57 +329,28 @@ class Auslesen:
                             if row_count % 50 == 0:
                                 time.sleep(0.2)
 
-                            continue
+                            if not veroeff_ok:
+                                # WICHTIG: NICHT weiter am DOM arbeiten, Tag kontrolliert beenden
+                                log_line(f"{tag}: Abbruch Tag nach VeröffText-Fehler (Zeile {i+1})")
+                                break
 
-                        # Normalfall: Zeile ok
-                        w.writerow([
-                            datum_txt.replace(";", ","),
-                            az.replace(";", ","),
-                            gericht.replace(";", ","),
-                            schuldner.replace(";", ","),
-                            sitz.replace(";", ","),
-                            register.replace(";", ","),
-                            veroeff
-                        ])
-                        row_count += 1
+                        # final flush
+                        f.flush()
+                        try:
+                            os.fsync(f.fileno())
+                        except Exception:
+                            pass
 
-                        # Status (sparsam)
-                        if row_count <= 20 or row_count % 100 == 0:
-                            self.ausgabe.append(f"{tag}: {row_count}/{len(rows)} …")
-
-                        # Crash-sicher flushen
-                        if row_count % 20 == 0:
-                            f.flush()
-                            try:
-                                os.fsync(f.fileno())
-                            except Exception:
-                                pass
-
-                        # kleine Bremse gegen Driver/Firefox Stress
-                        if row_count % 50 == 0:
-                            time.sleep(0.2)
-
-                    # final flush
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except Exception:
-                        pass
-
-                self.ausgabe.append(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
-                log_line(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
-
-                # Datum vorwärts + INI aktualisieren
-                self.datum_von += datetime.timedelta(days=1)
-                Config.schreiben(cfg_file(self.land), None, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
+                    self.ausgabe.append(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
+                    log_line(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
 
             except Exception as e:
+                tag_ok = False
                 log_exc(f"FATAL am Tag {tag}", e)
                 try:
                     self.ausgabe.append(f"{tag}: FEHLER – Details siehe protokoll.txt")
                 except Exception:
                     pass
-                break
 
             finally:
                 try:
@@ -381,5 +358,15 @@ class Auslesen:
                         driver.quit()
                 except Exception:
                     pass
+
+            # <<< Tages-Abbruch-Fix: Datum & INI nur fortschreiben, wenn der Tag wirklich OK war
+            if tag_ok:
+                self.datum_von += datetime.timedelta(days=1)
+                Config.schreiben(cfg_file(self.land), None, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
+                log_line(f"{tag}: Tag OK -> Datum fortgeschrieben auf {self.datum_von.strftime('%d.%m.%Y')}")
+            else:
+                self.ausgabe.append(f"{tag}: abgebrochen – Datum bleibt unverändert")
+                log_line(f"{tag}: Tag NICHT OK -> Datum bleibt {self.datum_von.strftime('%d.%m.%Y')} (kein INI-Write)")
+                break  # kontrollierter Abbruch der Gesamtschleife
 
         log_line("=== ENDE AUSLESEN ===")
