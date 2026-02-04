@@ -139,17 +139,26 @@ class Auslesen:
         )))
         land_opt.click()
         return wait
+        
+        def _set_datum(self, driver, wait, datum):
+            d = datum.strftime("%Y-%m-%d")
 
-    def _set_datum(self, wait, datum):
-        d = datum.strftime("%Y-%m-%d")
+            von = wait.until(ec.presence_of_element_located(
+                (By.ID, "frm_suche:ldi_datumVon:datumHtml5")
+            ))
+            bis = wait.until(ec.presence_of_element_located(
+                (By.ID, "frm_suche:ldi_datumBis:datumHtml5")
+            ))
 
-        von = wait.until(ec.presence_of_element_located((By.ID, "frm_suche:ldi_datumVon:datumHtml5")))
-        von.clear()
-        von.send_keys(d)
-
-        bis = wait.until(ec.presence_of_element_located((By.ID, "frm_suche:ldi_datumBis:datumHtml5")))
-        bis.clear()
-        bis.send_keys(d)
+            # JSF-sicher setzen per JavaScript
+            driver.execute_script("""
+                arguments[0].scrollIntoView({block: 'center'});
+                arguments[0].value = arguments[2];
+                arguments[0].dispatchEvent(new Event('change'));
+                arguments[1].scrollIntoView({block: 'center'});
+                arguments[1].value = arguments[2];
+                arguments[1].dispatchEvent(new Event('change'));
+            """, von, bis, d)
 
     # -----------------------------------------------------
 
@@ -184,7 +193,8 @@ class Auslesen:
                 driver = self._make_driver(firefox_path, page_load, headless)
                 wait = self._open_search_and_set_land(driver, url, wait_long)
 
-                self._set_datum(wait, self.datum_von)
+                self._set_datum(driver, wait, self.datum_von)
+
 
                 suchen = wait.until(ec.element_to_be_clickable((By.ID, "frm_suche:cbt_suchen")))
                 driver.execute_script("arguments[0].click();", suchen)
@@ -274,3 +284,4 @@ class Auslesen:
                 break
 
         log_line("=== ENDE AUSLESEN ===")
+
