@@ -17,7 +17,7 @@ from Scripte import Config
 
 
 # =========================================================
-# Config / Logging Helper
+# Helpers: Config / Logging
 # =========================================================
 
 def cfg_file(land: str) -> str:
@@ -28,16 +28,47 @@ def cfg_file(land: str) -> str:
 
 
 def cfg_get(cfg, section: str, option: str, fallback: str = "") -> str:
+    """Robust: cfg kann dict oder ConfigParser sein."""
     if isinstance(cfg, dict):
         try:
             return str(cfg.get(section, {}).get(option, fallback))
         except Exception:
             return str(fallback)
 
+    # ConfigParser-ähnlich
     try:
         return str(cfg.get(section, option, fallback=fallback))
     except Exception:
-        return str(fallback)
+        try:
+            # fallback ohne keyword
+            return str(cfg.get(section, option))
+        except Exception:
+            return str(fallback)
+
+
+def log_line(msg: str):
+    try:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open("protokoll.txt", "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+
+def log_exc(prefix: str, e: Exception):
+    log_line(f"{prefix}: {repr(e)}")
+    log_line(traceback.format_exc())
+
+
+def ensure_csv_exists(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow([
+                "Datum", "Aktenzeichen", "Gericht",
+                "Schuldner", "Sitz", "Register", "VeroeffText"
+            ])
 
 
 def read_timeouts(cfg):
@@ -50,36 +81,50 @@ def read_timeouts(cfg):
     wait_short = _get_int("timeouts", "wait_short", 30)
     wait_long  = _get_int("timeouts", "wait_long", 180)
     page_load  = _get_int("timeouts", "page_load", wait_long)
-    return wait_short, wait_long, page_load
 
+    # separat für den Text im Popup (soll nicht ewig hängen)
+    veroeff_timeout = _get_int("timeouts", "veroeff_timeout", 45)
 
-def ensure_csv_exists(path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if not os.path.exists(path):
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f, delimiter=";")
-            w.writerow([
-                "Datum", "Aktenzeichen", "Gericht",
-                "Schuldner", "Sitz", "Register", "VeroeffText"
-            ])
+    # Stufe-2: wie viele VeröffText-Fehler IN FOLGE -> Tagesabbruch
+    max_veroeff_fail_in_row = _get_int("timeouts", "max_veroeff_fail_in_row", 10)
 
-
-def log_line(msg):
-    try:
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open("protokoll.txt", "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
-    except Exception:
-        pass
-
-
-def log_exc(prefix, e):
-    log_line(f"{prefix}: {repr(e)}")
-    log_line(traceback.format_exc())
+    return wait_short, wait_long, page_load, veroeff_timeout, max_veroeff_fail_in_row
 
 
 # =========================================================
-# Hauptklasse
+# Popup Handling (ein Fenster wiederverwenden)
+# =========================================================
+
+def get_popup_handle(driver, main_handle: str, wait_long: int) -> str:
+    WebDriverWait(driver, wait_long).until(lambda d: len(d.window_handles) >= 2)
+    for h in driver.window_handles:
+        if h != main_handle:
+            return h
+    raise RuntimeError("Popup-Fenster nicht gefunden")
+
+
+def wait_popup_navigated(driver, popup_handle: str, old_url: str, timeout: int):
+    def _changed(d):
+        try:
+            d.switch_to.window(popup_handle)
+            cur = d.current_url
+            return (cur is not None) and (cur != old_url)
+        except Exception:
+            return False
+
+    WebDriverWait(driver, timeout).until(_changed)
+
+
+def read_veroefftext_from_popup(driver, popup_handle: str, timeout: int) -> str:
+    driver.switch_to.window(popup_handle)
+    pre = WebDriverWait(driver, timeout).until(
+        ec.presence_of_element_located((By.ID, "veroefftext"))
+    )
+    return pre.text
+
+
+# =========================================================
+# Main class
 # =========================================================
 
 class Auslesen:
@@ -124,6 +169,7 @@ class Auslesen:
         if headless:
             options.add_argument("-headless")
 
+        # Ressourcen sparen
         options.set_preference("permissions.default.image", 2)
 
         driver = webdriver.Firefox(options=options)
@@ -139,42 +185,50 @@ class Auslesen:
         )))
         land_opt.click()
         return wait
-        
-        def _set_datum(self, driver, wait, datum):
-            d = datum.strftime("%Y-%m-%d")
 
-            von = wait.until(ec.presence_of_element_located(
-                (By.ID, "frm_suche:ldi_datumVon:datumHtml5")
-            ))
-            bis = wait.until(ec.presence_of_element_located(
-                (By.ID, "frm_suche:ldi_datumBis:datumHtml5")
-            ))
+    def _set_datum_js(self, driver, wait, datum):
+        """JSF-sicher: keine clear()/send_keys auf type=date, sondern JS setzen."""
+        d = datum.strftime("%Y-%m-%d")
 
-            # JSF-sicher setzen per JavaScript
-            driver.execute_script("""
-                arguments[0].scrollIntoView({block: 'center'});
-                arguments[0].value = arguments[2];
-                arguments[0].dispatchEvent(new Event('change'));
-                arguments[1].scrollIntoView({block: 'center'});
-                arguments[1].value = arguments[2];
-                arguments[1].dispatchEvent(new Event('change'));
-            """, von, bis, d)
+        von = wait.until(ec.presence_of_element_located(
+            (By.ID, "frm_suche:ldi_datumVon:datumHtml5")
+        ))
+        bis = wait.until(ec.presence_of_element_located(
+            (By.ID, "frm_suche:ldi_datumBis:datumHtml5")
+        ))
+
+        driver.execute_script("""
+            arguments[0].scrollIntoView({block: 'center'});
+            arguments[0].value = arguments[2];
+            arguments[0].dispatchEvent(new Event('input', {bubbles:true}));
+            arguments[0].dispatchEvent(new Event('change', {bubbles:true}));
+
+            arguments[1].scrollIntoView({block: 'center'});
+            arguments[1].value = arguments[2];
+            arguments[1].dispatchEvent(new Event('input', {bubbles:true}));
+            arguments[1].dispatchEvent(new Event('change', {bubbles:true}));
+        """, von, bis, d)
 
     # -----------------------------------------------------
 
     def starten_alle_tage(self):
         log_line("=== START AUSLESEN ===")
+        log_line(f"CWD={os.getcwd()}")
+        log_line(f"CSV={self.csv_ausl}")
 
         url = "https://neu.insolvenzbekanntmachungen.de/ap/suche.jsf"
 
         cfg = Config.daten_auslesen(cfg_file(self.land))
-        wait_short, wait_long, page_load = read_timeouts(cfg)
+        wait_short, wait_long, page_load, veroeff_timeout, max_veroeff_fail_in_row = read_timeouts(cfg)
 
         firefox_path = cfg_get(cfg, "firefox", "pfad", "")
-        headless = cfg_get(cfg, "selenium", "headless", "1").lower() in ("1", "true", "yes")
+        headless_raw = cfg_get(cfg, "selenium", "headless", "1").strip().lower()
+        headless = headless_raw in ("1", "true", "yes", "on")
 
         self.ausgabe.append(
-            f"Timeouts: short={wait_short}s long={wait_long}s page_load={page_load}s | headless={int(headless)}"
+            f"Timeouts: short={wait_short}s long={wait_long}s page_load={page_load}s "
+            f"| veroeff_timeout={veroeff_timeout}s | max_fail_in_row={max_veroeff_fail_in_row} "
+            f"| headless={1 if headless else 0}"
         )
 
         datum_bis = datetime.datetime.today() - datetime.timedelta(days=1)
@@ -187,101 +241,180 @@ class Auslesen:
 
             driver = None
             tag_ok = True
-            veroeff_fail_count = 0   # <<< STUFE-2-ZÄHLER
 
             try:
+                # pro Tag neue Session (stabil)
                 driver = self._make_driver(firefox_path, page_load, headless)
+                main_handle = driver.current_window_handle
+                popup_handle = None
+                veroeff_fail_count = 0  # zählt Fehler IN FOLGE
+
                 wait = self._open_search_and_set_land(driver, url, wait_long)
 
-                self._set_datum(driver, wait, self.datum_von)
+                # Datum setzen
+                self._set_datum_js(driver, wait, self.datum_von)
 
-
+                # Suchen klicken
                 suchen = wait.until(ec.element_to_be_clickable((By.ID, "frm_suche:cbt_suchen")))
                 driver.execute_script("arguments[0].click();", suchen)
 
-                wait.until(lambda d: d.find_elements(By.ID, "tbl_ergebnis"))
+                # Warten: Ergebnis-Tabelle oder "keine Treffer"
+                def ready(d):
+                    if d.find_elements(By.ID, "tbl_ergebnis"):
+                        return True
+                    src = d.page_source.lower()
+                    return ("keine bekanntmachungen" in src or "keine treffer" in src or "keine ergebnisse" in src)
 
-                table = driver.find_element(By.ID, "tbl_ergebnis")
-                rows = table.find_elements(By.TAG_NAME, "tr")[1:]
-                log_line(f"{tag}: Treffer={len(rows)}")
+                WebDriverWait(driver, wait_long).until(ready)
 
-                with open(self.csv_ausl, "a", newline="", encoding="utf-8-sig") as f:
-                    w = csv.writer(f, delimiter=";")
+                tables = driver.find_elements(By.ID, "tbl_ergebnis")
+                if not tables:
+                    self.ausgabe.append(f"{tag}: keine Bekanntmachungen")
+                    log_line(f"{tag}: keine Bekanntmachungen")
+                else:
+                    # Anzahl Zeilen ermitteln (stabil)
+                    table = driver.find_element(By.ID, "tbl_ergebnis")
+                    rows = table.find_elements(By.CSS_SELECTOR, "tbody tr")
+                    n = len(rows)
+                    log_line(f"{tag}: Treffer={n}")
 
-                    for i in range(len(rows)):
-                        row = rows[i]
+                    row_count = 0
 
-                        datum_txt = row.find_element(By.CSS_SELECTOR, "[id$=':otx_datum']").text
-                        az        = row.find_element(By.CSS_SELECTOR, "[id$=':otx_azAkt']").text
-                        gericht   = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Gericht']").text
-                        schuldner = row.find_element(By.CSS_SELECTOR, "[id$=':otx_schuldner']").text
-                        sitz      = row.find_element(By.CSS_SELECTOR, "[id$=':otx_Sitz']").text
-                        register  = row.find_element(By.CSS_SELECTOR, "[id$=':otx_register']").text
+                    with open(self.csv_ausl, "a", newline="", encoding="utf-8-sig") as f:
+                        w = csv.writer(f, delimiter=";")
 
-                        veroeff = ""
-                        try:
-                            btn = row.find_element(By.CSS_SELECTOR, "input[alt='Veröffentlichungstext anzeigen']")
-                            driver.execute_script("arguments[0].click();", btn)
+                        for i in range(n):
+                            # Row jedes Mal neu holen (gegen Stale)
+                            table = driver.find_element(By.ID, "tbl_ergebnis")
+                            rows = table.find_elements(By.CSS_SELECTOR, "tbody tr")
+                            if i >= len(rows):
+                                # Tabelle hat sich unerwartet verändert -> Tag abbrechen
+                                log_line(f"{tag}: Unerwartete Tabellenänderung (i={i}, rows={len(rows)})")
+                                tag_ok = False
+                                break
 
-                            WebDriverWait(driver, wait_long).until(lambda d: len(d.window_handles) > 1)
-                            driver.switch_to.window(driver.window_handles[1])
+                            row = rows[i]
 
-                            pre = WebDriverWait(driver, wait_long).until(
-                                ec.presence_of_element_located((By.ID, "veroefftext"))
-                            )
-                            veroeff = pre.text.replace("\n", " ").replace(";", ",")
-                            veroeff_fail_count = 0   # <<< Erfolg → Reset
-                        except Exception:
-                            veroeff = ""
-                            veroeff_fail_count += 1
-                            log_line(f"{tag}: VeröffText fehlgeschlagen ({veroeff_fail_count})")
-                        finally:
                             try:
-                                while len(driver.window_handles) > 1:
-                                    driver.switch_to.window(driver.window_handles[-1])
-                                    driver.close()
-                                driver.switch_to.window(driver.window_handles[0])
-                            except Exception:
-                                pass
+                                datum_txt = row.find_element(By.CSS_SELECTOR, "span[id$=':otx_datum']").text
+                                az        = row.find_element(By.CSS_SELECTOR, "span[id$=':otx_azAkt']").text
+                                gericht   = row.find_element(By.CSS_SELECTOR, "span[id$=':otx_Gericht']").text
+                                schuldner = row.find_element(By.CSS_SELECTOR, "span[id$=':otx_schuldner']").text
+                                sitz      = row.find_element(By.CSS_SELECTOR, "span[id$=':otx_Sitz']").text
+                                register  = row.find_element(By.CSS_SELECTOR, "span[id$=':otx_register']").text
+                            except Exception as e:
+                                log_line(f"{tag}: Kerndaten nicht gelesen (Zeile {i+1}): {repr(e)}")
+                                tag_ok = False
+                                break
 
-                        w.writerow([
-                            datum_txt, az, gericht,
-                            schuldner, sitz, register, veroeff
-                        ])
+                            # Lupe klicken -> Popup lädt neue Seite
+                            veroeff = ""
+                            try:
+                                btn = row.find_element(By.CSS_SELECTOR, "input[alt='Veröffentlichungstext anzeigen']")
 
-                        if veroeff_fail_count >= 10:
-                            log_line(f"{tag}: 10 VeröffText-Fehler in Folge → Tagesabbruch")
-                            tag_ok = False
-                            break
+                                # alte Popup-URL merken, damit wir auf Navigation warten können
+                                old_url = ""
+                                if popup_handle is not None:
+                                    try:
+                                        driver.switch_to.window(popup_handle)
+                                        old_url = driver.current_url or ""
+                                    except Exception:
+                                        popup_handle = None
 
-                        if i % 100 == 0:
-                            self.ausgabe.append(f"{tag}: {i+1}/{len(rows)}")
+                                driver.switch_to.window(main_handle)
+                                driver.execute_script("arguments[0].click();", btn)
+
+                                if popup_handle is None:
+                                    popup_handle = get_popup_handle(driver, main_handle, wait_long)
+                                    old_url = ""  # beim ersten Mal reicht "irgendwas"
+
+                                # warten, dass Popup wirklich auf neue Seite navigiert
+                                wait_popup_navigated(driver, popup_handle, old_url, veroeff_timeout)
+
+                                # Text lesen
+                                veroeff = read_veroefftext_from_popup(driver, popup_handle, veroeff_timeout)
+                                veroeff_fail_count = 0  # Erfolg -> reset
+
+                            except Exception as e:
+                                veroeff = ""
+                                veroeff_fail_count += 1
+                                log_line(f"{tag}: VeröffText fehlgeschlagen (Zeile {i+1}, fail_in_row={veroeff_fail_count}): {repr(e)}")
+
+                            finally:
+                                # immer zurück ins Hauptfenster
+                                try:
+                                    driver.switch_to.window(main_handle)
+                                except Exception:
+                                    pass
+
+                            # CSV schreiben (immer)
+                            w.writerow([
+                                datum_txt.replace(";", ","),
+                                az.replace(";", ","),
+                                gericht.replace(";", ","),
+                                schuldner.replace(";", ","),
+                                sitz.replace(";", ","),
+                                register.replace(";", ","),
+                                (veroeff or "").replace("\n", " ").replace(";", ",")
+                            ])
+                            row_count += 1
+
+                            # Status
+                            if row_count <= 20 or row_count % 100 == 0:
+                                self.ausgabe.append(f"{tag}: {row_count}/{n}")
+
+                            # flush crash-sicher
+                            if row_count % 20 == 0:
+                                f.flush()
+                                try:
+                                    os.fsync(f.fileno())
+                                except Exception:
+                                    pass
+
+                            # Stufe-2: zu viele VeröffText-Fehler in Folge -> Tag abbrechen
+                            if veroeff_fail_count >= max_veroeff_fail_in_row:
+                                log_line(f"{tag}: Zu viele VeröffText-Fehler IN FOLGE ({veroeff_fail_count}) -> Tagesabbruch")
+                                self.ausgabe.append(f"{tag}: Abbruch – zu viele VeröffText-Fehler in Folge ({veroeff_fail_count})")
+                                tag_ok = False
+                                break
+
+                            # kleine Bremse
+                            if row_count % 50 == 0:
+                                time.sleep(0.15)
+
+                        # final flush
+                        f.flush()
+                        try:
+                            os.fsync(f.fileno())
+                        except Exception:
+                            pass
+
+                    self.ausgabe.append(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
+                    log_line(f"{tag}: CSV geschrieben ({row_count} Zeilen)")
 
             except Exception as e:
                 tag_ok = False
                 log_exc(f"FATAL am Tag {tag}", e)
+                try:
+                    self.ausgabe.append(f"{tag}: FEHLER – Details siehe protokoll.txt")
+                except Exception:
+                    pass
 
             finally:
-                if driver:
-                    try:
+                try:
+                    if driver:
                         driver.quit()
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
+            # Datum/INI nur fortschreiben, wenn der Tag OK war
             if tag_ok:
                 self.datum_von += datetime.timedelta(days=1)
-                Config.schreiben(
-                    cfg_file(self.land),
-                    None,
-                    "insobm",
-                    "datum",
-                    self.datum_von.strftime("%d.%m.%Y")
-                )
-                log_line(f"{tag}: Tag OK")
+                Config.schreiben(cfg_file(self.land), None, "insobm", "datum", self.datum_von.strftime("%d.%m.%Y"))
+                log_line(f"{tag}: Tag OK -> Datum fortgeschrieben auf {self.datum_von.strftime('%d.%m.%Y')}")
             else:
-                self.ausgabe.append(f"{tag}: abgebrochen – Datum bleibt")
-                log_line(f"{tag}: Tag abgebrochen")
+                log_line(f"{tag}: Tag NICHT OK -> Datum bleibt {self.datum_von.strftime('%d.%m.%Y')}")
+                # kontrollierter Abbruch der Gesamtschleife (du willst Fehler sehen, nicht drüberbügeln)
                 break
 
         log_line("=== ENDE AUSLESEN ===")
-
