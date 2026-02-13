@@ -1,30 +1,41 @@
 # -*- coding: utf-8 -*-
 
 import configparser
+import os
 
 
 def daten_auslesen(datei):
     """
-    config.ini auslesen
-    :param datei: Config-Datei
-    :return: gesuchter Wert
+    Config-Datei lesen
     """
     config = configparser.ConfigParser()
-    config.read(datei)
-    print(config.sections())
+    if os.path.exists(datei):
+        config.read(datei, encoding="utf-8")
     return config
 
 
 def schreiben(datei, config, sektion, option, wert):
     """
-    config-Datei beschreiben/aktualisieren
-    :type sektion: Sektion in der Config-Datei
-    :type config: Pfad der Config-Datei
-    :type option: Option in der Config-Datei
-    :type wert: Wert für die Option
-    :return: Nothing
+    Config-Datei beschreiben/aktualisieren
+
+    :param datei: Pfad der Config-Datei
+    :param config: ConfigParser-Objekt oder None
+    :param sektion: Sektion in der Config-Datei
+    :param option: Option in der Config-Datei
+    :param wert: Wert für die Option
     """
 
-    config.set(section=sektion, option=option, value=wert)
-    with open(datei, "w") as configfile:
+    # Falls kein Config-Objekt übergeben wurde -> neu einlesen
+    if config is None:
+        config = daten_auslesen(datei)
+
+    # Sektion ggf. anlegen
+    if not config.has_section(sektion):
+        config.add_section(sektion)
+
+    # Wert setzen
+    config.set(sektion, option, wert)
+
+    # Datei schreiben
+    with open(datei, "w", encoding="utf-8") as configfile:
         config.write(configfile)
