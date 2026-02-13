@@ -169,12 +169,21 @@ class Auslesen:
         if headless:
             options.add_argument("-headless")
 
+        # Stabilität: definierter Viewport
+        options.add_argument("--width=1400")
+        options.add_argument("--height=900")
+
         # Ressourcen sparen
         options.set_preference("permissions.default.image", 2)
+
+        # Stabilität: weniger “focus”-Zicken
+        options.set_preference("browser.tabs.remote.autostart", False)
+        options.set_preference("browser.tabs.remote.autostart.2", False)
 
         driver = webdriver.Firefox(options=options)
         driver.set_page_load_timeout(page_load)
         return driver
+
 
     def _open_search_and_set_land(self, driver, url, wait_long):
         driver.get(url)
@@ -418,3 +427,4 @@ class Auslesen:
                 break
 
         log_line("=== ENDE AUSLESEN ===")
+
